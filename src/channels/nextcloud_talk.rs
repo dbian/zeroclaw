@@ -303,17 +303,16 @@ impl NextcloudTalkChannel {
     }
 
     async fn send_to_room(&self, room_token: &str, content: &str) -> anyhow::Result<()> {
-        let encoded_room = urlencoding::encode(room_token);
-        let url = format!(
-            "{}/ocs/v2.php/apps/spreed/api/v1/chat/{}?format=json",
-            self.base_url, encoded_room
-        );
+        let random = Uuid::new_v4().simple().to_string();
+        let signature = nextcloud_talk_bot_signature(&self.app_token, &random, content);
+        let url = self.bot_message_url(room_token);
 
         let response = self
             .client
             .post(&url)
-            .bearer_auth(&self.app_token)
             .header("OCS-APIRequest", "true")
+            .header("X-Nextcloud-Talk-Bot-Random", &random)
+            .header("X-Nextcloud-Talk-Bot-Signature", signature)
             .header("Accept", "application/json")
             .json(&serde_json::json!({ "message": content }))
             .send()
@@ -328,6 +327,14 @@ impl NextcloudTalkChannel {
         let sanitized = crate::providers::sanitize_api_error(&body);
         tracing::error!("Nextcloud Talk send failed: {status} — {sanitized}");
         anyhow::bail!("Nextcloud Talk API error: {status}");
+    }
+
+    fn bot_message_url(&self, room_token: &str) -> String {
+        let encoded_room = urlencoding::encode(room_token);
+        format!(
+            "{}/ocs/v2.php/apps/spreed/api/v1/bot/{}/message",
+            self.base_url, encoded_room
+        )
     }
 }
 
@@ -400,6 +407,13 @@ pub fn verify_nextcloud_talk_signature(
     mac.update(payload.as_bytes());
 
     mac.verify_slice(&provided).is_ok()
+}
+
+fn nextcloud_talk_bot_signature(secret: &str, random: &str, message: &str) -> String {
+    let payload = format!("{random}{message}");
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("valid HMAC key");
+    mac.update(payload.as_bytes());
+    hex::encode(mac.finalize().into_bytes())
 }
 
 #[cfg(test)]
@@ -814,5 +828,27 @@ mod tests {
         assert!(verify_nextcloud_talk_signature(
             secret, random, body, &signature
         ));
+    }
+
+    #[test]
+    fn nextcloud_talk_bot_signature_matches_reference() {
+        let signature = nextcloud_talk_bot_signature("53CR3T", "abc123", "hello");
+        assert_eq!(
+            signature,
+            "bcfd738e97467247f34caca67183e7091fd56ed65ee189c8464500f7e0b42923"
+        );
+    }
+
+    #[test]
+    fn nextcloud_talk_bot_message_url_uses_bot_endpoint() {
+        let channel = NextcloudTalkChannel::new(
+            "https://cloud.example.com".into(),
+            "app-token".into(),
+            vec!["*".into()],
+        );
+        assert_eq!(
+            channel.bot_message_url("2d2p7jh5"),
+            "https://cloud.example.com/ocs/v2.php/apps/spreed/api/v1/bot/2d2p7jh5/message"
+        );
     }
 }
