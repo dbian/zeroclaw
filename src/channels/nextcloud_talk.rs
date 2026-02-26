@@ -7,19 +7,31 @@ use uuid::Uuid;
 /// Nextcloud Talk channel in webhook mode.
 ///
 /// Incoming messages are received by the gateway endpoint `/nextcloud-talk`.
-/// Outbound replies are sent through Nextcloud Talk OCS API.
+/// Outbound replies are sent through the Nextcloud Talk bot OCS API (`/bot/{token}/message`)
+/// using HMAC-SHA256 request signing when a `bot_secret` is configured.
+/// Falls back to bearer-auth on the standard `/chat/{token}` endpoint otherwise.
 pub struct NextcloudTalkChannel {
     base_url: String,
     app_token: String,
+    /// Shared bot secret used for HMAC signing of outgoing bot API requests.
+    /// Same value as the webhook signature secret — set via `webhook_secret` in config
+    /// or `ZEROCLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET` env var.
+    bot_secret: Option<String>,
     allowed_users: Vec<String>,
     client: reqwest::Client,
 }
 
 impl NextcloudTalkChannel {
-    pub fn new(base_url: String, app_token: String, allowed_users: Vec<String>) -> Self {
+    pub fn new(
+        base_url: String,
+        app_token: String,
+        bot_secret: Option<String>,
+        allowed_users: Vec<String>,
+    ) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             app_token,
+            bot_secret,
             allowed_users,
             client: reqwest::Client::new(),
         }
@@ -302,11 +314,97 @@ impl NextcloudTalkChannel {
         messages
     }
 
-    async fn send_to_room(&self, room_token: &str, content: &str) -> anyhow::Result<()> {
+    /// Compute the HMAC-SHA256 bot request signature.
+    ///
+    /// `hex(hmac_sha256(secret, random + body))`
+    fn sign_bot_request(secret: &str, random: &str, body: &str) -> String {
+        let payload = format!("{random}{body}");
+        // HMAC-SHA256 accepts any key length; this cannot fail in practice.
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
+            .expect("HMAC-SHA256 accepts any key length");
+        mac.update(payload.as_bytes());
+        hex::encode(mac.finalize().into_bytes())
+    }
+
+    /// Send a message to the room using the bot API (`/bot/{token}/message`) with HMAC signing.
+    async fn send_bot_message(
+        &self,
+        room_token: &str,
+        content: &str,
+        bot_secret: &str,
+    ) -> anyhow::Result<()> {
+        let encoded_room = urlencoding::encode(room_token);
+        let url = format!(
+            "{}/ocs/v2.php/apps/spreed/api/v1/bot/{}/message?format=json",
+            self.base_url, encoded_room
+        );
+
+        let body_json = serde_json::to_string(&serde_json::json!({ "message": content }))
+            .expect("serialising message body is infallible");
+        let random = Uuid::new_v4().to_string();
+        let signature = Self::sign_bot_request(bot_secret, &random, &body_json);
+
+        tracing::debug!(
+            room_token,
+            url = %url,
+            random = %random,
+            content_len = content.len(),
+            "Nextcloud Talk: sending via bot API"
+        );
+
+        let response = self
+            .client
+            .post(&url)
+            .header("X-Nextcloud-Talk-Bot-Random", &random)
+            .header("X-Nextcloud-Talk-Bot-Signature", &signature)
+            .header("OCS-APIRequest", "true")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .body(body_json)
+            .send()
+            .await
+            .map_err(|e| {
+                tracing::error!(room_token, error = %e, "Nextcloud Talk: HTTP request failed");
+                e
+            })?;
+
+        let status = response.status();
+        let resp_body = response.text().await.unwrap_or_default();
+        tracing::debug!(
+            room_token,
+            status = status.as_u16(),
+            response = %resp_body,
+            "Nextcloud Talk: bot API response"
+        );
+
+        if status.is_success() {
+            tracing::info!(room_token, "Nextcloud Talk: message delivered via bot API");
+            return Ok(());
+        }
+
+        let sanitized = crate::providers::sanitize_api_error(&resp_body);
+        tracing::error!(
+            room_token,
+            status = status.as_u16(),
+            error = %sanitized,
+            "Nextcloud Talk: bot API send failed"
+        );
+        anyhow::bail!("Nextcloud Talk bot API error: {status}");
+    }
+
+    /// Send a message using the legacy OCS chat endpoint with bearer auth.
+    async fn send_ocs_message(&self, room_token: &str, content: &str) -> anyhow::Result<()> {
         let encoded_room = urlencoding::encode(room_token);
         let url = format!(
             "{}/ocs/v2.php/apps/spreed/api/v1/chat/{}?format=json",
             self.base_url, encoded_room
+        );
+
+        tracing::debug!(
+            room_token,
+            url = %url,
+            content_len = content.len(),
+            "Nextcloud Talk: sending via OCS bearer auth"
         );
 
         let response = self
@@ -317,17 +415,182 @@ impl NextcloudTalkChannel {
             .header("Accept", "application/json")
             .json(&serde_json::json!({ "message": content }))
             .send()
-            .await?;
+            .await
+            .map_err(|e| {
+                tracing::error!(room_token, error = %e, "Nextcloud Talk: HTTP request failed");
+                e
+            })?;
 
-        if response.status().is_success() {
+        let status = response.status();
+        let resp_body = response.text().await.unwrap_or_default();
+        tracing::debug!(
+            room_token,
+            status = status.as_u16(),
+            response = %resp_body,
+            "Nextcloud Talk: OCS API response"
+        );
+
+        if status.is_success() {
+            tracing::info!(room_token, "Nextcloud Talk: message delivered via OCS API");
             return Ok(());
         }
 
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        let sanitized = crate::providers::sanitize_api_error(&body);
-        tracing::error!("Nextcloud Talk send failed: {status} — {sanitized}");
+        let sanitized = crate::providers::sanitize_api_error(&resp_body);
+        tracing::error!(
+            room_token,
+            status = status.as_u16(),
+            error = %sanitized,
+            "Nextcloud Talk: OCS send failed"
+        );
         anyhow::bail!("Nextcloud Talk API error: {status}");
+    }
+
+    async fn send_to_room(&self, room_token: &str, content: &str) -> anyhow::Result<()> {
+        if let Some(ref secret) = self.bot_secret {
+            self.send_bot_message(room_token, content, secret).await
+        } else {
+            self.send_ocs_message(room_token, content).await
+        }
+    }
+
+    /// React to a message using the bot API.
+    ///
+    /// Requires `bot_secret` to be set (bots-v1 capability).
+    /// POST `/ocs/v2.php/apps/spreed/api/v1/bot/{token}/reaction/{messageId}`
+    pub async fn send_reaction(
+        &self,
+        room_token: &str,
+        message_id: &str,
+        reaction: &str,
+    ) -> anyhow::Result<()> {
+        let Some(ref bot_secret) = self.bot_secret else {
+            anyhow::bail!("Nextcloud Talk: bot_secret required for send_reaction");
+        };
+
+        let encoded_room = urlencoding::encode(room_token);
+        let encoded_msg = urlencoding::encode(message_id);
+        let url = format!(
+            "{}/ocs/v2.php/apps/spreed/api/v1/bot/{}/reaction/{}?format=json",
+            self.base_url, encoded_room, encoded_msg
+        );
+
+        let body_json = serde_json::to_string(&serde_json::json!({ "reaction": reaction }))
+            .expect("serialising reaction body is infallible");
+        let random = Uuid::new_v4().to_string();
+        let signature = Self::sign_bot_request(bot_secret, &random, &body_json);
+
+        tracing::debug!(
+            room_token,
+            message_id,
+            reaction,
+            url = %url,
+            "Nextcloud Talk: sending reaction via bot API"
+        );
+
+        let response = self
+            .client
+            .post(&url)
+            .header("X-Nextcloud-Talk-Bot-Random", &random)
+            .header("X-Nextcloud-Talk-Bot-Signature", &signature)
+            .header("OCS-APIRequest", "true")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .body(body_json)
+            .send()
+            .await?;
+
+        let status = response.status();
+        let resp_body = response.text().await.unwrap_or_default();
+        tracing::debug!(
+            room_token,
+            message_id,
+            status = status.as_u16(),
+            response = %resp_body,
+            "Nextcloud Talk: reaction API response"
+        );
+
+        if status.is_success() {
+            return Ok(());
+        }
+        let sanitized = crate::providers::sanitize_api_error(&resp_body);
+        tracing::error!(
+            room_token,
+            message_id,
+            status = status.as_u16(),
+            error = %sanitized,
+            "Nextcloud Talk: reaction failed"
+        );
+        anyhow::bail!("Nextcloud Talk reaction API error: {status}");
+    }
+
+    /// Remove a previously added reaction from a message using the bot API.
+    ///
+    /// Requires `bot_secret` to be set (bots-v1 capability).
+    /// DELETE `/ocs/v2.php/apps/spreed/api/v1/bot/{token}/reaction/{messageId}`
+    pub async fn delete_reaction(
+        &self,
+        room_token: &str,
+        message_id: &str,
+        reaction: &str,
+    ) -> anyhow::Result<()> {
+        let Some(ref bot_secret) = self.bot_secret else {
+            anyhow::bail!("Nextcloud Talk: bot_secret required for delete_reaction");
+        };
+
+        let encoded_room = urlencoding::encode(room_token);
+        let encoded_msg = urlencoding::encode(message_id);
+        let url = format!(
+            "{}/ocs/v2.php/apps/spreed/api/v1/bot/{}/reaction/{}?format=json",
+            self.base_url, encoded_room, encoded_msg
+        );
+
+        let body_json = serde_json::to_string(&serde_json::json!({ "reaction": reaction }))
+            .expect("serialising reaction body is infallible");
+        let random = Uuid::new_v4().to_string();
+        let signature = Self::sign_bot_request(bot_secret, &random, &body_json);
+
+        tracing::debug!(
+            room_token,
+            message_id,
+            reaction,
+            url = %url,
+            "Nextcloud Talk: deleting reaction via bot API"
+        );
+
+        let response = self
+            .client
+            .delete(&url)
+            .header("X-Nextcloud-Talk-Bot-Random", &random)
+            .header("X-Nextcloud-Talk-Bot-Signature", &signature)
+            .header("OCS-APIRequest", "true")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .body(body_json)
+            .send()
+            .await?;
+
+        let status = response.status();
+        let resp_body = response.text().await.unwrap_or_default();
+        tracing::debug!(
+            room_token,
+            message_id,
+            status = status.as_u16(),
+            response = %resp_body,
+            "Nextcloud Talk: delete reaction API response"
+        );
+
+        if status.is_success() {
+            return Ok(());
+        }
+        let sanitized = crate::providers::sanitize_api_error(&resp_body);
+        tracing::error!(
+            room_token,
+            message_id,
+            status = status.as_u16(),
+            error = %sanitized,
+            "Nextcloud Talk: delete reaction failed"
+        );
+        anyhow::bail!("Nextcloud Talk delete reaction API error: {status}");
     }
 }
 
@@ -410,6 +673,7 @@ mod tests {
         NextcloudTalkChannel::new(
             "https://cloud.example.com".into(),
             "app-token".into(),
+            None,
             vec!["user_a".into()],
         )
     }
@@ -429,6 +693,7 @@ mod tests {
         let wildcard = NextcloudTalkChannel::new(
             "https://cloud.example.com".into(),
             "app-token".into(),
+            None,
             vec!["*".into()],
         );
         assert!(wildcard.is_user_allowed("any_user"));
@@ -490,6 +755,7 @@ mod tests {
         let channel = NextcloudTalkChannel::new(
             "https://cloud.example.com".into(),
             "app-token".into(),
+            None,
             vec!["*".into()],
         );
         let payload = serde_json::json!({
@@ -528,6 +794,7 @@ mod tests {
         let channel = NextcloudTalkChannel::new(
             "https://cloud.example.com".into(),
             "app-token".into(),
+            None,
             vec!["*".into()],
         );
         let payload = serde_json::json!({
@@ -551,6 +818,7 @@ mod tests {
         let channel = NextcloudTalkChannel::new(
             "https://cloud.example.com".into(),
             "app-token".into(),
+            None,
             vec!["*".into()],
         );
         let payload = serde_json::json!({
@@ -576,6 +844,7 @@ mod tests {
         let channel = NextcloudTalkChannel::new(
             "https://cloud.example.com".into(),
             "app-token".into(),
+            None,
             vec!["booting".into()],
         );
         let payload = serde_json::json!({
@@ -614,6 +883,7 @@ mod tests {
         let channel = NextcloudTalkChannel::new(
             "https://cloud.example.com".into(),
             "app-token".into(),
+            None,
             vec!["*".into()],
         );
         let payload = serde_json::json!({
@@ -646,6 +916,7 @@ mod tests {
         let channel = NextcloudTalkChannel::new(
             "https://cloud.example.com".into(),
             "app-token".into(),
+            None,
             vec!["*".into()],
         );
         let payload = serde_json::json!({
@@ -678,6 +949,7 @@ mod tests {
         let channel = NextcloudTalkChannel::new(
             "https://cloud.example.com".into(),
             "app-token".into(),
+            None,
             vec!["allowed_user".into()],
         );
         let payload = serde_json::json!({
@@ -710,6 +982,7 @@ mod tests {
         let channel = NextcloudTalkChannel::new(
             "https://cloud.example.com".into(),
             "app-token".into(),
+            None,
             vec!["*".into()],
         );
         let payload = serde_json::json!({
@@ -742,6 +1015,7 @@ mod tests {
         let channel = NextcloudTalkChannel::new(
             "https://cloud.example.com".into(),
             "app-token".into(),
+            None,
             vec!["*".into()],
         );
         let payload = serde_json::json!({
@@ -814,5 +1088,56 @@ mod tests {
         assert!(verify_nextcloud_talk_signature(
             secret, random, body, &signature
         ));
+    }
+
+    #[test]
+    fn nextcloud_talk_sign_bot_request_deterministic() {
+        let secret = TEST_WEBHOOK_SECRET;
+        let random = "fixed-random";
+        let body = r#"{"message":"hello"}"#;
+
+        let sig1 = NextcloudTalkChannel::sign_bot_request(secret, random, body);
+        let sig2 = NextcloudTalkChannel::sign_bot_request(secret, random, body);
+        assert_eq!(sig1, sig2);
+        assert!(!sig1.is_empty());
+
+        // Changing the random must produce a different signature.
+        let sig3 = NextcloudTalkChannel::sign_bot_request(secret, "other-random", body);
+        assert_ne!(sig1, sig3);
+    }
+
+    #[test]
+    fn nextcloud_talk_sign_bot_request_matches_incoming_verification() {
+        let secret = TEST_WEBHOOK_SECRET;
+        let random = "sync-random";
+        let body = r#"{"message":"hi"}"#;
+
+        // Outgoing signature produced by sign_bot_request…
+        let outgoing_sig = NextcloudTalkChannel::sign_bot_request(secret, random, body);
+
+        // …must pass the same verify_nextcloud_talk_signature used for incoming webhooks.
+        assert!(verify_nextcloud_talk_signature(
+            secret,
+            random,
+            body,
+            &outgoing_sig
+        ));
+    }
+
+    #[test]
+    fn nextcloud_talk_has_bot_secret_when_provided() {
+        let channel = NextcloudTalkChannel::new(
+            "https://cloud.example.com".into(),
+            "app-token".into(),
+            Some("my-bot-secret".into()),
+            vec!["*".into()],
+        );
+        assert!(channel.bot_secret.is_some());
+    }
+
+    #[test]
+    fn nextcloud_talk_no_bot_secret_when_none() {
+        let channel = make_channel();
+        assert!(channel.bot_secret.is_none());
     }
 }

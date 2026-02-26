@@ -529,23 +529,14 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .is_some_and(|qq| qq.receive_mode == crate::config::schema::QQReceiveMode::Webhook);
 
     // Nextcloud Talk channel (if configured)
-    let nextcloud_talk_channel: Option<Arc<NextcloudTalkChannel>> =
-        config.channels_config.nextcloud_talk.as_ref().map(|nc| {
-            Arc::new(NextcloudTalkChannel::new(
-                nc.base_url.clone(),
-                nc.app_token.clone(),
-                nc.allowed_users.clone(),
-            ))
-        });
-
-    // Nextcloud Talk webhook secret for signature verification
-    // Priority: environment variable > config file
-    let nextcloud_talk_webhook_secret: Option<Arc<str>> =
+    // Compute the bot secret (webhook_secret) first so it can be passed to the channel
+    // for signing outgoing bot API requests.
+    let nextcloud_talk_bot_secret: Option<String> =
         std::env::var("ZEROCLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET")
             .ok()
-            .and_then(|secret| {
-                let secret = secret.trim();
-                (!secret.is_empty()).then(|| secret.to_owned())
+            .and_then(|s| {
+                let s = s.trim().to_owned();
+                (!s.is_empty()).then_some(s)
             })
             .or_else(|| {
                 config
@@ -556,11 +547,24 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
                         nc.webhook_secret
                             .as_deref()
                             .map(str::trim)
-                            .filter(|secret| !secret.is_empty())
+                            .filter(|s| !s.is_empty())
                             .map(ToOwned::to_owned)
                     })
-            })
-            .map(Arc::from);
+            });
+
+    let nextcloud_talk_channel: Option<Arc<NextcloudTalkChannel>> =
+        config.channels_config.nextcloud_talk.as_ref().map(|nc| {
+            Arc::new(NextcloudTalkChannel::new(
+                nc.base_url.clone(),
+                nc.app_token.clone(),
+                nextcloud_talk_bot_secret.clone(),
+                nc.allowed_users.clone(),
+            ))
+        });
+
+    // Nextcloud Talk webhook secret for signature verification
+    // Priority: environment variable > config file
+    let nextcloud_talk_webhook_secret: Option<Arc<str>> = nextcloud_talk_bot_secret.map(Arc::from);
 
     // ── Pairing guard ──────────────────────────────────────
     let pairing = Arc::new(PairingGuard::new(
@@ -1748,6 +1752,8 @@ async fn handle_nextcloud_talk_webhook(
 
     let body_str = String::from_utf8_lossy(&body);
 
+    tracing::debug!(body_len = body.len(), "Nextcloud Talk: webhook received");
+
     // ── Security: Verify Nextcloud Talk HMAC signature if secret is configured ──
     if let Some(ref webhook_secret) = state.nextcloud_talk_webhook_secret {
         let random = headers
@@ -1759,6 +1765,12 @@ async fn handle_nextcloud_talk_webhook(
             .get("X-Nextcloud-Talk-Signature")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
+
+        tracing::debug!(
+            random_present = !random.is_empty(),
+            signature_present = !signature.is_empty(),
+            "Nextcloud Talk: verifying webhook signature"
+        );
 
         if !crate::channels::nextcloud_talk::verify_nextcloud_talk_signature(
             webhook_secret,
@@ -1779,15 +1791,25 @@ async fn handle_nextcloud_talk_webhook(
                 Json(serde_json::json!({"error": "Invalid signature"})),
             );
         }
+        tracing::debug!("Nextcloud Talk: signature verified OK");
     }
 
     // Parse JSON body
     let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        tracing::warn!("Nextcloud Talk: invalid JSON payload");
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "Invalid JSON payload"})),
         );
     };
+
+    tracing::debug!(
+        event_type = payload
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown"),
+        "Nextcloud Talk: parsed webhook payload"
+    );
 
     // Parse messages from webhook payload
     let messages = nextcloud_talk.parse_webhook_payload(&payload);
@@ -1796,43 +1818,77 @@ async fn handle_nextcloud_talk_webhook(
         return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
     }
 
-    for msg in &messages {
-        tracing::info!(
-            "Nextcloud Talk message from {}: {}",
-            msg.sender,
-            truncate_with_ellipsis(&msg.content, 50)
-        );
+    tracing::debug!(
+        count = messages.len(),
+        "Nextcloud Talk: dispatching messages"
+    );
 
-        if state.auto_save {
-            let key = nextcloud_talk_memory_key(msg);
-            let _ = state
-                .mem
-                .store(&key, &msg.content, MemoryCategory::Conversation, None)
-                .await;
-        }
+    // Spawn async task so the webhook returns HTTP 200 immediately while
+    // the LLM processes the request.  An immediate "thinking" message is sent
+    // to the room before the LLM call so users see a prompt acknowledgement.
+    let state_clone = state.clone();
+    let nextcloud_talk_arc = Arc::clone(nextcloud_talk);
+    tokio::spawn(async move {
+        for msg in &messages {
+            tracing::info!(
+                sender = %msg.sender,
+                room = %msg.reply_target,
+                content = %truncate_with_ellipsis(&msg.content, 50),
+                "Nextcloud Talk: processing message"
+            );
 
-        match run_gateway_chat_with_tools(&state, &msg.content).await {
-            Ok(response) => {
-                let safe_response =
-                    sanitize_gateway_response(&response, state.tools_registry_exec.as_ref());
-                if let Err(e) = nextcloud_talk
-                    .send(&SendMessage::new(safe_response, &msg.reply_target))
-                    .await
-                {
-                    tracing::error!("Failed to send Nextcloud Talk reply: {e}");
-                }
-            }
-            Err(e) => {
-                tracing::error!("LLM error for Nextcloud Talk message: {e:#}");
-                let _ = nextcloud_talk
-                    .send(&SendMessage::new(
-                        "Sorry, I couldn't process your message right now.",
-                        &msg.reply_target,
-                    ))
+            if state_clone.auto_save {
+                let key = nextcloud_talk_memory_key(msg);
+                let _ = state_clone
+                    .mem
+                    .store(&key, &msg.content, MemoryCategory::Conversation, None)
                     .await;
             }
+
+            // Send an immediate acknowledgement so the user knows the bot received
+            // the message and is working on a response.
+            if let Err(e) = nextcloud_talk_arc
+                .send(&SendMessage::new("⏳ …", &msg.reply_target))
+                .await
+            {
+                tracing::warn!(error = %e, "Nextcloud Talk: failed to send thinking indicator");
+            }
+
+            tracing::debug!(
+                room = %msg.reply_target,
+                "Nextcloud Talk: calling LLM"
+            );
+
+            match run_gateway_chat_with_tools(&state_clone, &msg.content).await {
+                Ok(response) => {
+                    tracing::debug!(
+                        room = %msg.reply_target,
+                        response_len = response.len(),
+                        "Nextcloud Talk: LLM response ready"
+                    );
+                    let safe_response = sanitize_gateway_response(
+                        &response,
+                        state_clone.tools_registry_exec.as_ref(),
+                    );
+                    if let Err(e) = nextcloud_talk_arc
+                        .send(&SendMessage::new(safe_response, &msg.reply_target))
+                        .await
+                    {
+                        tracing::error!(error = %e, "Nextcloud Talk: failed to send reply");
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Nextcloud Talk: LLM error");
+                    let _ = nextcloud_talk_arc
+                        .send(&SendMessage::new(
+                            "Sorry, I couldn't process your message right now.",
+                            &msg.reply_target,
+                        ))
+                        .await;
+                }
+            }
         }
-    }
+    });
 
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
 }
@@ -3146,17 +3202,18 @@ Reminder set successfully."#;
         let provider: Arc<dyn Provider> = provider_impl.clone();
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
 
-        let channel = Arc::new(NextcloudTalkChannel::new(
-            "https://cloud.example.com".into(),
-            "app-token".into(),
-            vec!["*".into()],
-        ));
-
         let secret = "nextcloud-test-secret";
         let random = "seed-value";
         let body = r#"{"type":"message","object":{"token":"room-token"},"message":{"actorType":"users","actorId":"user_a","message":"hello"}}"#;
         let _valid_signature = compute_nextcloud_signature_hex(secret, random, body);
         let invalid_signature = "deadbeef";
+
+        let channel = Arc::new(NextcloudTalkChannel::new(
+            "https://cloud.example.com".into(),
+            "app-token".into(),
+            Some(secret.to_string()),
+            vec!["*".into()],
+        ));
 
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),

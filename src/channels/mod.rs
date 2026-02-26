@@ -4158,6 +4158,7 @@ fn collect_configured_channels(
             channel: Arc::new(NextcloudTalkChannel::new(
                 nc.base_url.clone(),
                 nc.app_token.clone(),
+                nc.webhook_secret.clone(),
                 nc.allowed_users.clone(),
             )),
         });
