@@ -78,6 +78,7 @@ impl NextcloudTalkChannel {
     /// - `object.token`: room token
     /// - `message.actorType`, `message.actorId`, `message.message`, `message.timestamp`
     pub fn parse_webhook_payload(&self, payload: &serde_json::Value) -> Vec<ChannelMessage> {
+        tracing::debug!("Nextcloud Talk: received webhook payload: {payload}");
         let event_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
         if event_type.eq_ignore_ascii_case("Create") {
@@ -91,7 +92,9 @@ impl NextcloudTalkChannel {
             return messages;
         }
 
+        tracing::debug!("Nextcloud Talk: parsing legacy message payload");
         let Some(message_obj) = payload.get("message") else {
+            tracing::warn!("Nextcloud Talk: missing 'message' object in legacy payload");
             return messages;
         };
 
@@ -104,19 +107,21 @@ impl NextcloudTalkChannel {
             .filter(|token| !token.is_empty());
 
         let Some(room_token) = room_token else {
-            tracing::warn!("Nextcloud Talk: missing room token in webhook payload");
+            tracing::warn!("Nextcloud Talk: missing room token in webhook payload: {payload}");
             return messages;
         };
+        tracing::debug!("Nextcloud Talk legacy: room_token: {room_token}");
 
         let actor_type = message_obj
             .get("actorType")
             .and_then(|v| v.as_str())
             .or_else(|| payload.get("actorType").and_then(|v| v.as_str()))
             .unwrap_or("");
+        tracing::debug!("Nextcloud Talk legacy: actorType: {actor_type}");
 
         // Ignore bot-originated messages to prevent feedback loops.
         if actor_type.eq_ignore_ascii_case("bots") {
-            tracing::debug!("Nextcloud Talk: skipping bot-originated message");
+            tracing::debug!("Nextcloud Talk: skipping bot-originated message (legacy format)");
             return messages;
         }
 
@@ -128,9 +133,10 @@ impl NextcloudTalkChannel {
             .filter(|id| !id.is_empty());
 
         let Some(actor_id) = actor_id else {
-            tracing::warn!("Nextcloud Talk: missing actorId in webhook payload");
+            tracing::warn!("Nextcloud Talk: missing actorId in webhook payload: {payload}");
             return messages;
         };
+        tracing::debug!("Nextcloud Talk legacy: actorId: {actor_id}");
 
         if !self.is_user_allowed(actor_id) {
             tracing::warn!(
@@ -145,6 +151,7 @@ impl NextcloudTalkChannel {
             .get("messageType")
             .and_then(|v| v.as_str())
             .unwrap_or("comment");
+        tracing::debug!("Nextcloud Talk legacy: messageType: {message_type}");
         if !message_type.eq_ignore_ascii_case("comment") {
             tracing::debug!("Nextcloud Talk: skipping non-comment messageType: {message_type}");
             return messages;
@@ -168,8 +175,10 @@ impl NextcloudTalkChannel {
             .filter(|content| !content.is_empty());
 
         let Some(content) = content else {
+            tracing::debug!("Nextcloud Talk legacy: no content in message body");
             return messages;
         };
+        tracing::debug!("Nextcloud Talk legacy: content: {content}");
 
         let message_id = Self::value_to_string(message_obj.get("id"))
             .unwrap_or_else(|| Uuid::new_v4().to_string());
@@ -197,6 +206,7 @@ impl NextcloudTalkChannel {
     /// Message text is extracted from `object.content`, which is a JSON-encoded string
     /// with a `message` field: `{"message":"...","parameters":[...]}`.
     fn parse_activitypub_payload(&self, payload: &serde_json::Value) -> Vec<ChannelMessage> {
+        tracing::debug!("Nextcloud Talk: parsing ActivityPub payload");
         let mut messages = Vec::new();
 
         let actor = payload.get("actor").unwrap_or(&serde_json::Value::Null);
@@ -204,17 +214,18 @@ impl NextcloudTalkChannel {
         // Skip bot-originated messages (Application type) to prevent feedback loops.
         let actor_ap_type = actor.get("type").and_then(|v| v.as_str()).unwrap_or("");
         if actor_ap_type.eq_ignore_ascii_case("Application") {
-            tracing::debug!("Nextcloud Talk: skipping bot-originated message (ActivityPub format)");
+            tracing::debug!("Nextcloud Talk: skipping bot-originated message (ActivityPub format, actor type: Application)");
             return messages;
         }
 
         // actor.id format is "<actorType>/<username>", e.g. "users/booting" or "bots/mybot".
         let actor_id_raw = actor.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        tracing::debug!("Nextcloud Talk ActivityPub: actor.id: {actor_id_raw}");
 
         // Also skip when the actor type prefix is "bots".
         let actor_type_prefix = actor_id_raw.split('/').next().unwrap_or("");
         if actor_type_prefix.eq_ignore_ascii_case("bots") {
-            tracing::debug!("Nextcloud Talk: skipping bot-originated message (bots prefix)");
+            tracing::debug!("Nextcloud Talk: skipping bot-originated message (ActivityPub format, prefix: bots)");
             return messages;
         }
 
@@ -226,9 +237,10 @@ impl NextcloudTalkChannel {
             .filter(|id| !id.is_empty());
 
         let Some(actor_id) = actor_id else {
-            tracing::warn!("Nextcloud Talk: missing actor id in ActivityPub payload");
+            tracing::warn!("Nextcloud Talk: missing actor id in ActivityPub payload: {actor_id_raw}");
             return messages;
         };
+        tracing::debug!("Nextcloud Talk ActivityPub: extracted actorId: {actor_id}");
 
         if !self.is_user_allowed(actor_id) {
             tracing::warn!(
@@ -257,12 +269,13 @@ impl NextcloudTalkChannel {
         // Only handle objects with name "message" (skip system/other events).
         let object_name = object.get("name").and_then(|v| v.as_str()).unwrap_or("");
         if !object_name.eq_ignore_ascii_case("message") {
-            tracing::debug!("Nextcloud Talk: skipping non-message object name: {object_name}");
+            tracing::debug!("Nextcloud Talk ActivityPub: skipping non-message object name: {object_name}");
             return messages;
         }
 
         // object.content is a JSON-encoded string: {"message":"...","parameters":[...]}.
         let content_raw = object.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        tracing::debug!("Nextcloud Talk ActivityPub: raw content: {content_raw}");
         let content =
             if let Ok(content_json) = serde_json::from_str::<serde_json::Value>(content_raw) {
                 content_json
@@ -273,6 +286,7 @@ impl NextcloudTalkChannel {
                     .map(str::to_string)
             } else {
                 // Fallback: use raw content string if it is not JSON-encoded.
+                tracing::debug!("Nextcloud Talk ActivityPub: content is not JSON-encoded, using fallback");
                 let trimmed = content_raw.trim();
                 if trimmed.is_empty() {
                     None
@@ -282,8 +296,10 @@ impl NextcloudTalkChannel {
             };
 
         let Some(content) = content else {
+            tracing::debug!("Nextcloud Talk ActivityPub: no content extracted");
             return messages;
         };
+        tracing::debug!("Nextcloud Talk ActivityPub: parsed content: {content}");
 
         let message_id =
             Self::value_to_string(object.get("id")).unwrap_or_else(|| Uuid::new_v4().to_string());
@@ -303,6 +319,7 @@ impl NextcloudTalkChannel {
     }
 
     async fn send_to_room(&self, room_token: &str, content: &str) -> anyhow::Result<()> {
+        tracing::debug!("Nextcloud Talk: sending message to room {room_token}: {content}");
         let random = Uuid::new_v4().simple().to_string();
         let signature = nextcloud_talk_bot_signature(&self.app_token, &random, content);
         let url = self.bot_message_url(room_token);
@@ -319,6 +336,7 @@ impl NextcloudTalkChannel {
             .await?;
 
         if response.status().is_success() {
+            tracing::debug!("Nextcloud Talk: message sent successfully to {room_token}");
             return Ok(());
         }
 
@@ -396,17 +414,24 @@ pub fn verify_nextcloud_talk_signature(
         .trim();
 
     let Ok(provided) = hex::decode(signature_hex) else {
-        tracing::warn!("Nextcloud Talk: invalid signature format");
+        tracing::warn!("Nextcloud Talk: invalid signature format (not hex): {signature_hex}");
         return false;
     };
 
     let payload = format!("{random}{body}");
     let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(secret.as_bytes()) else {
+        tracing::error!("Nextcloud Talk: failed to create HMAC from secret");
         return false;
     };
     mac.update(payload.as_bytes());
 
-    mac.verify_slice(&provided).is_ok()
+    if let Err(e) = mac.verify_slice(&provided) {
+        tracing::debug!("Nextcloud Talk: signature verification failed: {e}");
+        false
+    } else {
+        tracing::debug!("Nextcloud Talk: signature verification successful");
+        true
+    }
 }
 
 fn nextcloud_talk_bot_signature(secret: &str, random: &str, message: &str) -> String {
