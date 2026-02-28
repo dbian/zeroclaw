@@ -4949,6 +4949,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         Some(webhook_secret.trim().to_string())
                     },
                     allowed_users,
+                    push_tool_progress: true,
                 });
 
                 println!("  {} Nextcloud Talk configured", style("✅").green().bold());

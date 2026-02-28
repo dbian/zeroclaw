@@ -4105,10 +4105,6 @@ pub struct NextcloudTalkConfig {
     pub push_tool_progress: bool,
 }
 
-fn default_true() -> bool {
-    true
-}
-
 impl ChannelConfig for NextcloudTalkConfig {
     fn name() -> &'static str {
         "NextCloud Talk"
