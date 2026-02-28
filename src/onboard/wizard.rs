@@ -8001,6 +8001,7 @@ mod tests {
             app_token: Some("token".into()),
             webhook_secret: Some("secret".into()),
             allowed_users: vec!["*".into()],
+            push_tool_progress: true,
         });
         assert!(has_launchable_channels(&channels));
     }

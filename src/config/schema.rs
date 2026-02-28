@@ -10502,6 +10502,7 @@ default_model = "legacy-model"
             app_token: Some("app-token".into()),
             webhook_secret: Some("webhook-secret".into()),
             allowed_users: vec!["user_a".into(), "*".into()],
+            push_tool_progress: true,
         };
 
         let json = serde_json::to_string(&nc).unwrap();

@@ -516,6 +516,7 @@ mod tests {
             app_token: Some("app-token".into()),
             webhook_secret: None,
             allowed_users: vec!["*".into()],
+            push_tool_progress: true,
         });
         assert!(has_supervised_channels(&config));
     }

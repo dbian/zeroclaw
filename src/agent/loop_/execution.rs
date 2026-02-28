@@ -137,7 +137,8 @@ pub(super) async fn execute_tools_parallel(
         .collect();
 
     let results = futures_util::future::join_all(futures).await;
-    Ok(results)
+    let outcomes: Vec<ToolExecutionOutcome> = results.into_iter().filter_map(|r| r.ok()).collect();
+    Ok(outcomes)
 }
 
 pub(super) async fn execute_tools_sequential(
@@ -149,16 +150,17 @@ pub(super) async fn execute_tools_sequential(
     let mut outcomes = Vec::with_capacity(tool_calls.len());
 
     for call in tool_calls {
-        outcomes.push(
-            execute_one_tool(
-                &call.name,
-                call.arguments.clone(),
-                tools_registry,
-                observer,
-                cancellation_token,
-            )
-            .await,
-        );
+        if let Ok(outcome) = execute_one_tool(
+            &call.name,
+            call.arguments.clone(),
+            tools_registry,
+            observer,
+            cancellation_token,
+        )
+        .await
+        {
+            outcomes.push(outcome);
+        }
     }
 
     Ok(outcomes)

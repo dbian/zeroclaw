@@ -97,6 +97,7 @@ mod tests {
             app_token: Some("app-token".into()),
             webhook_secret: None,
             allowed_users: vec!["*".into()],
+            push_tool_progress: true,
         };
 
         assert_eq!(telegram.allowed_users.len(), 1);
