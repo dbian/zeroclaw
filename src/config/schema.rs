@@ -4100,6 +4100,13 @@ pub struct NextcloudTalkConfig {
     /// Allowed Nextcloud actor IDs (`[]` = deny all, `"*"` = allow all).
     #[serde(default)]
     pub allowed_users: Vec<String>,
+    /// Whether to push tool-call progress updates to the channel. Default: `true`.
+    #[serde(default = "default_true")]
+    pub push_tool_progress: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl ChannelConfig for NextcloudTalkConfig {

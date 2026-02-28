@@ -308,6 +308,8 @@ pub struct AppState {
     pub nextcloud_talk: Option<Arc<NextcloudTalkChannel>>,
     /// Nextcloud Talk webhook secret for signature verification
     pub nextcloud_talk_webhook_secret: Option<Arc<str>>,
+    /// Whether to push tool progress messages to Nextcloud Talk
+    pub nextcloud_talk_push_tool_progress: bool,
     pub wati: Option<Arc<WatiChannel>>,
     pub qq: Option<Arc<QQChannel>>,
     pub qq_webhook_enabled: bool,
@@ -558,15 +560,19 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .map(Arc::from);
 
     // Nextcloud Talk channel (if configured)
-    let nextcloud_talk_channel: Option<Arc<NextcloudTalkChannel>> =
-        config.channels_config.nextcloud_talk.as_ref().map(|nc| {
-            Arc::new(NextcloudTalkChannel::new(
-                nc.base_url.clone(),
-                nc.app_token.clone(),
-                nextcloud_talk_webhook_secret_raw,
-                nc.allowed_users.clone(),
-            ))
-        });
+    let (nextcloud_talk_channel, nextcloud_talk_push_tool_progress) =
+        match config.channels_config.nextcloud_talk.as_ref() {
+            Some(nc) => (
+                Some(Arc::new(NextcloudTalkChannel::new(
+                    nc.base_url.clone(),
+                    nc.app_token.clone(),
+                    nextcloud_talk_webhook_secret_raw,
+                    nc.allowed_users.clone(),
+                ))),
+                nc.push_tool_progress,
+            ),
+            None => (None, true),
+        };
 
     // ── Pairing guard ──────────────────────────────────────
     let pairing = Arc::new(PairingGuard::new(
@@ -689,6 +695,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         linq_signing_secret,
         nextcloud_talk: nextcloud_talk_channel,
         nextcloud_talk_webhook_secret,
+        nextcloud_talk_push_tool_progress,
         wati: wati_channel,
         qq: qq_channel,
         qq_webhook_enabled,
@@ -967,12 +974,137 @@ async fn run_gateway_chat_simple(state: &AppState, message: &str) -> anyhow::Res
 }
 
 /// Full-featured chat with tools for channel handlers (WhatsApp, Linq, Nextcloud Talk).
+pub(super) async fn run_gateway_chat_with_tools_streamable(
+    state: &AppState,
+    message: &str,
+    on_delta: Option<tokio::sync::mpsc::Sender<String>>,
+) -> anyhow::Result<String> {
+    let config = state.config.lock().clone();
+    let observer: Arc<dyn Observer> =
+        Arc::from(crate::observability::create_observer(&config.observability));
+    let runtime: Arc<dyn crate::runtime::RuntimeAdapter> =
+        Arc::from(crate::runtime::create_runtime(&config.runtime)?);
+    let security = Arc::new(crate::security::SecurityPolicy::from_config(
+        &config.autonomy,
+        &config.workspace_dir,
+    ));
+    let mem = state.mem.clone();
+
+    let (composio_key, composio_entity_id) = if config.composio.enabled {
+        (
+            config.composio.api_key.as_deref(),
+            Some(config.composio.entity_id.as_str()),
+        )
+    } else {
+        (None, None)
+    };
+    let mut tools_registry = crate::tools::all_tools_with_runtime(
+        Arc::new(config.clone()),
+        &security,
+        runtime,
+        mem.clone(),
+        composio_key,
+        composio_entity_id,
+        &config.browser,
+        &config.http_request,
+        &config.web_fetch,
+        &config.workspace_dir,
+        &config.agents,
+        config.api_key.as_deref(),
+        &config,
+    );
+    let peripheral_tools: Vec<Box<dyn Tool>> =
+        crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
+    tools_registry.extend(peripheral_tools);
+
+    let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
+    let model_name = config
+        .default_model
+        .clone()
+        .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into());
+    let provider_runtime_options = crate::providers::ProviderRuntimeOptions {
+        auth_profile_override: None,
+        provider_api_url: config.api_url.clone(),
+        zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
+        secrets_encrypt: config.secrets.encrypt,
+        reasoning_enabled: config.runtime.reasoning_enabled,
+        reasoning_level: config.effective_provider_reasoning_level(),
+        custom_provider_api_mode: config.provider_api.map(|mode| mode.as_compatible_mode()),
+        max_tokens_override: None,
+        model_support_vision: config.model_support_vision,
+    };
+    let provider: Box<dyn crate::providers::Provider> =
+        crate::providers::create_routed_provider_with_options(
+            provider_name,
+            config.api_key.as_deref(),
+            config.api_url.as_deref(),
+            &config.reliability,
+            &config.model_routes,
+            &model_name,
+            &provider_runtime_options,
+        )?;
+
+    let mut tool_descs: Vec<(&str, &str)> = vec![
+        ("shell", "Execute terminal commands."),
+        ("file_read", "Read file contents."),
+        ("file_write", "Write file contents."),
+        ("memory_store", "Save to memory."),
+        ("memory_recall", "Search memory."),
+        ("memory_forget", "Delete a memory entry."),
+    ];
+
+    let native_tools = provider.supports_native_tools();
+    let mut system_prompt = crate::channels::build_system_prompt_with_mode(
+        &config.workspace_dir,
+        &model_name,
+        &tool_descs,
+        &[], // skills
+        Some(&config.identity),
+        None, // bootstrap_max_chars
+        native_tools,
+        config.skills.prompt_injection_mode,
+    );
+    if !native_tools {
+        system_prompt.push_str(&crate::agent::loop_::build_tool_instructions(&tools_registry));
+    }
+    system_prompt.push_str(&crate::agent::loop_::build_shell_policy_instructions(
+        &config.autonomy,
+    ));
+
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
+    let enriched = format!("[{now}] {message}");
+
+    let mut history = vec![
+        crate::providers::ChatMessage::system(&system_prompt),
+        crate::providers::ChatMessage::user(&enriched),
+    ];
+
+    crate::agent::loop_::run_tool_call_loop(
+        provider.as_ref(),
+        &mut history,
+        &tools_registry,
+        observer.as_ref(),
+        provider_name,
+        &model_name,
+        config.default_temperature,
+        true, // silent
+        None, // approval
+        "gateway",
+        &config.multimodal,
+        config.agent.max_tool_iterations,
+        None, // cancellation_token
+        on_delta,
+        None, // hooks
+        &[],  // excluded_tools
+    )
+    .await
+}
+
 pub(super) async fn run_gateway_chat_with_tools(
     state: &AppState,
     message: &str,
 ) -> anyhow::Result<String> {
-    let config = state.config.lock().clone();
-    crate::agent::process_message(config, message).await
+    run_gateway_chat_with_tools_streamable(state, message, None).await
 }
 
 fn sanitize_gateway_response(response: &str, tools: &[Box<dyn Tool>]) -> String {
@@ -1850,7 +1982,23 @@ async fn handle_nextcloud_talk_webhook(
                 .await;
         }
 
-        match run_gateway_chat_with_tools(&state, &msg.content).await {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(10);
+        let nt_tx = nextcloud_talk.clone();
+        let reply_target = msg.reply_target.clone();
+        let push_enabled = state.nextcloud_talk_push_tool_progress;
+
+        tokio::spawn(async move {
+            while let Some(delta) = rx.recv().await {
+                // Intercept tool progress markers
+                if push_enabled {
+                    if let Some(progress) = delta.strip_prefix(crate::agent::loop_::DRAFT_PROGRESS_SENTINEL) {
+                        let _ = nt_tx.send(&SendMessage::new(progress, &reply_target)).await;
+                    }
+                }
+            }
+        });
+
+        match run_gateway_chat_with_tools_streamable(&state, &msg.content, Some(tx)).await {
             Ok(response) => {
                 let safe_response =
                     sanitize_gateway_response(&response, state.tools_registry_exec.as_ref());
