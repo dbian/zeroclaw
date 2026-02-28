@@ -663,12 +663,8 @@ pub(crate) async fn run_tool_call_loop(
 
         // ── Progress: LLM thinking ────────────────────────────
         if let Some(ref tx) = on_delta {
-            let phase = if iteration == 0 {
-                "\u{1f914} Thinking...\n".to_string()
-            } else {
-                format!("\u{1f914} Thinking (round {})...\n", iteration + 1)
-            };
-            let _ = tx.send(format!("{DRAFT_PROGRESS_SENTINEL}{phase}")).await;
+            // Reduced verbosity for thinking progress
+            let _ = tx.send(format!("{DRAFT_PROGRESS_SENTINEL}")).await;
         }
 
         observer.record_event(&ObserverEvent::LlmRequest {
@@ -864,15 +860,8 @@ pub(crate) async fn run_tool_call_loop(
 
         // ── Progress: LLM responded ─────────────────────────────
         if let Some(ref tx) = on_delta {
-            let llm_secs = llm_started_at.elapsed().as_secs();
-            if !tool_calls.is_empty() {
-                let _ = tx
-                    .send(format!(
-                        "{DRAFT_PROGRESS_SENTINEL}\u{1f4ac} Got {} tool call(s) ({llm_secs}s)\n",
-                        tool_calls.len()
-                    ))
-                    .await;
-            }
+            // Reduced verbosity for tool call count
+            let _ = tx.send(format!("{DRAFT_PROGRESS_SENTINEL}")).await;
         }
 
         if tool_calls.is_empty() {

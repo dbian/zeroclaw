@@ -137,7 +137,7 @@ pub(super) async fn execute_tools_parallel(
         .collect();
 
     let results = futures_util::future::join_all(futures).await;
-    results.into_iter().collect()
+    Ok(results)
 }
 
 pub(super) async fn execute_tools_sequential(
@@ -157,7 +157,7 @@ pub(super) async fn execute_tools_sequential(
                 observer,
                 cancellation_token,
             )
-            .await?,
+            .await,
         );
     }
 
